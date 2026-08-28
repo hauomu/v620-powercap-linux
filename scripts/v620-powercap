@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# SPDX-License-Identifier: GPL-2.0-only
+AMD_VENDOR="0x1002"
+V620_DEVICE="0x73a1"
+V620_SUBSYSTEM_VENDOR="0x1002"
+V620_SUBSYSTEM_DEVICE="0x0e34"
+PCI_OVERRIDE="${V620_PCI:-}"
+WAIT_SECONDS="${V620_WAIT_SECONDS:-60}"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  v620-powercap [--pci BDF] detect
+  v620-powercap [--pci BDF] status
+  v620-powercap [--pci BDF] set WATTS
+  v620-powercap [--pci BDF] wait-set WATTS
+  v620-powercap apply-config [CONFIG_FILE]
+EOF
+}
+
+read_one() {
+    local f="$1"
+    [[ -r "$f" ]] && tr '[:upper:]' '[:lower:]' < "$f" || true
+}
+
+is_v620_device() {
+    local d="$1"
+    [[ "$(read_one "$d/vendor")" == "$AMD_VENDOR" ]] &&
+    [[ "$(read_one "$d/device")" == "$V620_DEVICE" ]] &&
+    [[ "$(read_one "$d/subsystem_vendor")" == "$V620_SUBSYSTEM_VENDOR" ]] &&
+    [[ "$(read_one "$d/subsystem_device")" == "$V620_SUBSYSTEM_DEVICE" ]]
+}
+
+find_devices() {
+    local d
+    if [[ -n "$PCI_OVERRIDE" ]]; then
+        d="/sys/bus/pci/devices/$PCI_OVERRIDE"
+        [[ -d "$d" ]] || { echo "ERROR: PCI device not found: $PCI_OVERRIDE" >&2; return 1; }
+        is_v620_device "$d" || { echo "ERROR: $PCI_OVERRIDE is not the expected V620" >&2; return 1; }
+        printf '%s\n' "$d"
+        return
+    fi
+    for d in /sys/bus/pci/devices/*; do
+        [[ -d "$d" ]] || continue
+        is_v620_device "$d" && printf '%s\n' "$d"
+    done
+}
+
+choose_device() {
+    mapfile -t devices < <(find_devices)
+    if ((${#devices[@]} == 0)); then
+        echo "ERROR: no matching Radeon Pro V620 found" >&2
+        return 1
+    fi
+    if ((${#devices[@]} > 1)); then
+        echo "ERROR: multiple matching V620 devices found:" >&2
+        printf '  %s\n' "${devices[@]##*/}" >&2
+        echo "Use --pci BDF or V620_PCI." >&2
+        return 1
+    fi
+    printf '%s\n' "${devices[0]}"
+}
+
+find_hwmon() {
+    local dev="$1" h
+    for h in "$dev"/hwmon/hwmon*; do
+        [[ -d "$h" ]] || continue
+        [[ "$(cat "$h/name" 2>/dev/null || true)" == "amdgpu" ]] || continue
+        [[ -e "$h/power1_cap" ]] || continue
+        printf '%s\n' "$h"
+        return 0
+    done
+    return 1
+}
+
+uw_to_w() { awk -v x="$1" 'BEGIN { printf "%.3f", x / 1000000 }'; }
+w_to_uw() { awk -v x="$1" 'BEGIN { printf "%.0f", x * 1000000 }'; }
+
+validate_watts() {
+    [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "ERROR: invalid wattage: $1" >&2; return 1; }
+    awk -v x="$1" 'BEGIN { exit !(x > 0) }' || { echo "ERROR: wattage must be > 0" >&2; return 1; }
+}
+
+show_status() {
+    local dev hw current min max
+    dev="$(choose_device)"
+    hw="$(find_hwmon "$dev")" || { echo "ERROR: amdgpu power-cap hwmon not found for ${dev##*/}" >&2; return 1; }
+    current="$(cat "$hw/power1_cap")"
+    min="$(cat "$hw/power1_cap_min" 2>/dev/null || true)"
+    max="$(cat "$hw/power1_cap_max" 2>/dev/null || true)"
+    echo "PCI:         ${dev##*/}"
+    echo "hwmon:       $hw"
+    echo "current cap: $(uw_to_w "$current") W"
+    [[ -n "$min" ]] && echo "minimum:     $(uw_to_w "$min") W"
+    [[ -n "$max" ]] && echo "maximum:     $(uw_to_w "$max") W"
+}
+
+set_cap() {
+    local watts="$1" dev hw target min max actual
+    validate_watts "$watts"
+    [[ "${EUID:-$(id -u)}" -eq 0 ]] || { echo "ERROR: setting power1_cap requires root; use sudo" >&2; return 1; }
+    dev="$(choose_device)"
+    hw="$(find_hwmon "$dev")" || { echo "ERROR: amdgpu power-cap hwmon not found for ${dev##*/}" >&2; return 1; }
+    target="$(w_to_uw "$watts")"
+    min="$(cat "$hw/power1_cap_min" 2>/dev/null || true)"
+    max="$(cat "$hw/power1_cap_max" 2>/dev/null || true)"
+
+    if [[ -n "$min" ]] && (( target < min )); then
+        echo "ERROR: requested ${watts} W is below exposed minimum $(uw_to_w "$min") W" >&2
+        return 1
+    fi
+    if [[ -n "$max" ]] && (( target > max )); then
+        echo "ERROR: requested ${watts} W is above firmware/driver maximum $(uw_to_w "$max") W" >&2
+        return 1
+    fi
+
+    printf '%s\n' "$target" > "$hw/power1_cap"
+    actual="$(cat "$hw/power1_cap")"
+    [[ "$actual" == "$target" ]] || { echo "ERROR: cap readback differs: requested=$target actual=$actual uW" >&2; return 1; }
+    echo "V620 ${dev##*/}: power cap set to $(uw_to_w "$actual") W"
+}
+
+wait_set() {
+    local watts="$1" i dev hw
+    validate_watts "$watts"
+    for ((i=1; i<=WAIT_SECONDS; i++)); do
+        if dev="$(choose_device 2>/dev/null)" && hw="$(find_hwmon "$dev" 2>/dev/null)" && [[ -e "$hw/power1_cap" ]]; then
+            set_cap "$watts"
+            return
+        fi
+        sleep 1
+    done
+    echo "ERROR: V620 amdgpu power-cap interface did not appear within ${WAIT_SECONDS}s" >&2
+    return 1
+}
+
+apply_config() {
+    local cfg="${1:-/etc/v620-powercap.conf}"
+    [[ -r "$cfg" ]] || { echo "ERROR: config not readable: $cfg" >&2; return 1; }
+    # shellcheck disable=SC1090
+    source "$cfg"
+    [[ -n "${POWER_CAP_W:-}" ]] || { echo "ERROR: POWER_CAP_W is not set in $cfg" >&2; return 1; }
+    [[ -z "${V620_PCI:-}" ]] || PCI_OVERRIDE="$V620_PCI"
+    wait_set "$POWER_CAP_W"
+}
+
+if [[ "${1:-}" == "--pci" ]]; then
+    [[ $# -ge 3 ]] || { usage; exit 2; }
+    PCI_OVERRIDE="$2"
+    shift 2
+fi
+
+case "${1:-}" in
+    detect)
+        mapfile -t devices < <(find_devices)
+        ((${#devices[@]} > 0)) || { echo "No matching Radeon Pro V620 found."; exit 1; }
+        printf '%s\n' "${devices[@]##*/}"
+        ;;
+    status) show_status ;;
+    set) [[ $# -eq 2 ]] || { usage; exit 2; }; set_cap "$2" ;;
+    wait-set) [[ $# -eq 2 ]] || { usage; exit 2; }; wait_set "$2" ;;
+    apply-config) [[ $# -le 2 ]] || { usage; exit 2; }; apply_config "${2:-/etc/v620-powercap.conf}" ;;
+    -h|--help|help|"") usage ;;
+    *) usage; exit 2 ;;
+esac

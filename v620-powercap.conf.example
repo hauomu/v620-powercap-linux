@@ -1,0 +1,5 @@
+# Desired persistent V620 cap in watts.
+POWER_CAP_W=175
+
+# Optional. Leave unset when there is only one matching V620.
+# V620_PCI=0000:53:00.0

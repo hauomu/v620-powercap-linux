@@ -1,0 +1,12 @@
+[Unit]
+Description=Apply configured Radeon Pro V620 power cap
+After=systemd-modules-load.service
+ConditionPathExists=/sys/bus/pci/devices
+
+[Service]
+Type=oneshot
+ExecStart=@BIN_PATH@ apply-config @CONFIG_PATH@
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
