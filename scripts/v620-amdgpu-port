@@ -168,12 +168,34 @@ src = Path(sys.argv[1]).resolve()
 min_w = int(sys.argv[2])
 out = Path(sys.argv[3])
 
-matches = list(src.glob("**/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c"))
-if len(matches) != 1:
-    raise SystemExit(f"ERROR: expected exactly one amdgpu_smu.c target, found {len(matches)}")
-target = matches[0]
+# AMD's DKMS package flattens/relocates parts of the upstream kernel tree, so
+# never assume the full in-tree drivers/gpu/drm/... path. Find amdgpu_smu.c
+# by filename, then select it by the SMU power-limit code we actually patch.
+candidates = []
+for p in src.rglob("amdgpu_smu.c"):
+    try:
+        candidate_text = p.read_text()
+    except (OSError, UnicodeError):
+        continue
+    required = (
+        "smu_get_asic_power_limits",
+        "&smu->current_power_limit",
+        "&smu->default_power_limit",
+        "&smu->max_power_limit",
+        "&smu->min_power_limit",
+        "Failed to get asic power limits!",
+    )
+    if all(token in candidate_text for token in required):
+        candidates.append((p, candidate_text))
+
+if len(candidates) != 1:
+    paths = ", ".join(str(p.relative_to(src)) for p, _ in candidates) or "none"
+    raise SystemExit(
+        f"ERROR: expected exactly one semantic amdgpu_smu.c target, found {len(candidates)} ({paths}); nothing modified"
+    )
+
+target, text = candidates[0]
 rel = target.relative_to(src).as_posix()
-text = target.read_text()
 
 BEGIN = "/* V620_PPT_OVERRIDE_BEGIN */"
 END = "/* V620_PPT_OVERRIDE_END */"
