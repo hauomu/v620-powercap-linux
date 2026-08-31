@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+MIN_W=175
+DRIVER_SERIES=31.50
+INSTALL_DRIVER=0
+VERIFY_ONLY=0
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  sudo v620-amdgpu-port [--min-w 175] [--install-driver]
+  sudo v620-amdgpu-port --verify [--min-w 175]
+
+Default action: port the V620 PPT-minimum patch to the newest installed AMD amdgpu DKMS source,
+rebuild it for the running kernel, and install it.
+
+--install-driver  Also register AMD's 31.50 Ubuntu 26.04 repository and install amdgpu-dkms first.
+--min-w N        Driver-visible V620 minimum PPT in watts (default: 175; maximum: 250).
+--verify         After reboot, verify the loaded DKMS driver and V620 power-cap range.
+USAGE
+}
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+log() { printf '\n===== %s =====\n' "$*"; }
+
+while (($#)); do
+  case "$1" in
+    --install-driver) INSTALL_DRIVER=1 ;;
+    --verify) VERIFY_ONLY=1 ;;
+    --min-w)
+      shift
+      [[ ${1:-} =~ ^[0-9]+$ ]] || die "--min-w requires an integer"
+      MIN_W="$1"
+      ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+  shift
+done
+
+[[ $EUID -eq 0 ]] || die "run with sudo"
+[[ $MIN_W =~ ^[0-9]+$ ]] || die "invalid MIN_W"
+(( MIN_W >= 1 && MIN_W <= 250 )) || die "--min-w must be between 1 and 250 W"
+
+KVER="$(uname -r)"
+
+find_latest_amdgpu_source() {
+  local d
+  mapfile -t _srcs < <(
+    for d in /usr/src/amdgpu-*; do
+      [[ -d "$d" && -f "$d/dkms.conf" ]] && printf '%s\n' "$d"
+    done | sort -V
+  )
+  ((${#_srcs[@]})) || return 1
+  printf '%s\n' "${_srcs[-1]}"
+}
+
+verify_v620() {
+  local src ver status module_file found=0 dev hw min max cap
+  src="$(find_latest_amdgpu_source)" || die "no /usr/src/amdgpu-*/dkms.conf source found"
+  ver="${src#/usr/src/amdgpu-}"
+
+  log "DKMS DRIVER"
+  status="$(dkms status -m amdgpu -v "$ver" -k "$KVER" 2>/dev/null || true)"
+  echo "$status"
+  grep -q 'installed' <<<"$status" || die "amdgpu DKMS $ver is not installed for $KVER"
+
+  module_file="$(modinfo -k "$KVER" -n amdgpu 2>/dev/null || true)"
+  echo "kernel module path: ${module_file:-unknown}"
+  [[ "$module_file" == *"updates/dkms"* || "$module_file" == *"updates"* ]] || \
+    die "amdgpu for $KVER is not resolving to the DKMS-installed module"
+
+  log "V620 POWER RANGE"
+  for dev in /sys/bus/pci/devices/*; do
+    [[ -r "$dev/vendor" && -r "$dev/device" && -r "$dev/subsystem_vendor" && -r "$dev/subsystem_device" ]] || continue
+    [[ "$(cat "$dev/vendor")" == "0x1002" ]] || continue
+    [[ "$(cat "$dev/device")" == "0x73a1" ]] || continue
+    [[ "$(cat "$dev/subsystem_vendor")" == "0x1002" ]] || continue
+    [[ "$(cat "$dev/subsystem_device")" == "0x0e34" ]] || continue
+
+    hw=""
+    for hw in "$dev"/hwmon/hwmon*; do
+      [[ -r "$hw/name" && "$(cat "$hw/name")" == "amdgpu" && -r "$hw/power1_cap" ]] && break
+      hw=""
+    done
+    [[ -n "$hw" ]] || die "V620 ${dev##*/}: amdgpu hwmon power1_cap not found"
+    [[ -r "$hw/power1_cap_min" && -r "$hw/power1_cap_max" ]] || \
+      die "V620 ${dev##*/}: power1_cap_min/max not exposed by amdgpu"
+
+    min="$(cat "$hw/power1_cap_min")"
+    max="$(cat "$hw/power1_cap_max")"
+    cap="$(cat "$hw/power1_cap")"
+    printf '%s  min=%sW  current=%sW  max=%sW\n' \
+      "${dev##*/}" "$((min/1000000))" "$((cap/1000000))" "$((max/1000000))"
+
+    (( min <= MIN_W * 1000000 )) || die "V620 ${dev##*/}: minimum is still above ${MIN_W} W"
+    (( max >= MIN_W * 1000000 )) || die "V620 ${dev##*/}: maximum is below requested ${MIN_W} W"
+
+    printf '%d\n' "$((MIN_W * 1000000))" > "$hw/power1_cap"
+    cap="$(cat "$hw/power1_cap")"
+    (( cap == MIN_W * 1000000 )) || die "V620 ${dev##*/}: ${MIN_W} W write did not stick"
+    printf '          set/readback=%sW  PASS\n' "$((cap/1000000))"
+    ((found+=1))
+  done
+  (( found > 0 )) || die "no exact Radeon Pro V620 (1002:73a1 / 1002:0e34) found"
+
+  echo
+  echo "PASS: AMD DKMS driver is active and V620 minimum PPT is <= ${MIN_W} W."
+}
+
+if (( VERIFY_ONLY )); then
+  verify_v620
+  exit 0
+fi
+
+if command -v mokutil >/dev/null 2>&1 && mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'; then
+  die "Secure Boot is enabled. Refusing an unattended DKMS migration that could leave amdgpu unenrolled."
+fi
+
+if (( INSTALL_DRIVER )); then
+  log "PREPARE AMD 31.50 DRIVER"
+  . /etc/os-release
+  [[ "${ID:-}" == ubuntu && "${VERSION_ID:-}" == "26.04" && "${VERSION_CODENAME:-}" == resolute ]] || \
+    die "--install-driver is intentionally limited to Ubuntu 26.04 (resolute)"
+
+  if [[ ! -e "/lib/modules/$KVER/build/Makefile" ]]; then
+    apt-get update
+    apt-get install -y "linux-headers-$KVER"
+  fi
+  [[ -e "/lib/modules/$KVER/build/Makefile" ]] || die "kernel headers/build tree missing for $KVER"
+
+  install -d -m 0755 /etc/apt/keyrings
+  tmpkey="$(mktemp)"
+  trap 'rm -f "$tmpkey"' EXIT
+  wget -qO- https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > "$tmpkey"
+  install -m 0644 "$tmpkey" /etc/apt/keyrings/rocm.gpg
+
+  cat >/etc/apt/sources.list.d/amdgpu.list <<EOF_REPO
+deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/amdgpu/${DRIVER_SERIES}/ubuntu resolute main
+EOF_REPO
+
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y amdgpu-dkms patch python3
+fi
+
+[[ -e "/lib/modules/$KVER/build/Makefile" ]] || die "kernel headers/build tree missing for $KVER"
+command -v dkms >/dev/null || die "dkms is not installed"
+command -v patch >/dev/null || die "patch is not installed"
+command -v python3 >/dev/null || die "python3 is not installed"
+
+SRC="$(find_latest_amdgpu_source)" || die "no AMD amdgpu DKMS source found under /usr/src"
+VER="${SRC#/usr/src/amdgpu-}"
+PATCH_NAME="v620-ppt-min-${MIN_W}w.patch"
+PATCH_DIR="$SRC/patches"
+PATCH_FILE="$PATCH_DIR/$PATCH_NAME"
+OVERRIDE="/etc/dkms/amdgpu-${VER}.conf"
+
+log "PORT V620 PATCH TO AMDGPU $VER"
+mkdir -p "$PATCH_DIR" /etc/dkms
+
+python3 - "$SRC" "$MIN_W" "$PATCH_FILE" <<'PY'
+from __future__ import annotations
+import difflib, re, sys
+from pathlib import Path
+
+src = Path(sys.argv[1]).resolve()
+min_w = int(sys.argv[2])
+out = Path(sys.argv[3])
+
+matches = list(src.glob("**/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c"))
+if len(matches) != 1:
+    raise SystemExit(f"ERROR: expected exactly one amdgpu_smu.c target, found {len(matches)}")
+target = matches[0]
+rel = target.relative_to(src).as_posix()
+text = target.read_text()
+
+BEGIN = "/* V620_PPT_OVERRIDE_BEGIN */"
+END = "/* V620_PPT_OVERRIDE_END */"
+if BEGIN in text or END in text:
+    raise SystemExit("ERROR: AMD package source is already directly modified; refusing to stack another patch")
+
+init_re = re.compile(r"""
+(?P<indent>^[ \t]*)
+ret[ \t]*=[ \t]*smu_get_asic_power_limits\(
+    [ \t]*smu,[ \t]*\n
+    [ \t]*&smu->current_power_limit,[ \t]*\n
+    [ \t]*&smu->default_power_limit,[ \t]*\n
+    [ \t]*&smu->max_power_limit,[ \t]*\n
+    [ \t]*&smu->min_power_limit
+[ \t]*\);[ \t]*\n
+(?P=indent)if[ \t]*\([ \t]*ret[ \t]*\)[ \t]*\{[ \t]*\n
+(?P<body>.*?)
+(?P=indent)\}[ \t]*\n
+""", re.MULTILINE | re.DOTALL | re.VERBOSE)
+
+ms = list(init_re.finditer(text))
+if len(ms) != 1:
+    raise SystemExit(f"ERROR: expected exactly one SMU power-limit initialization block, found {len(ms)}; nothing modified")
+m = ms[0]
+body = m.group("body")
+if "Failed to get asic power limits!" not in body or "return ret;" not in body:
+    raise SystemExit("ERROR: SMU block changed unexpectedly; nothing modified")
+
+i = m.group("indent")
+t = i + "\t"
+injection = (
+    f"\n{i}{BEGIN}\n"
+    f"{i}/* Exact Radeon Pro V620 host-PPT minimum override: 1002:73a1 / 1002:0e34. */\n"
+    f"{i}if (adev->pdev->vendor == 0x1002 &&\n"
+    f"{i}    adev->pdev->device == 0x73a1 &&\n"
+    f"{i}    adev->pdev->subsystem_vendor == 0x1002 &&\n"
+    f"{i}    adev->pdev->subsystem_device == 0x0e34 &&\n"
+    f"{i}    smu->min_power_limit > {min_w} &&\n"
+    f"{i}    smu->max_power_limit >= {min_w}) {{\n"
+    f"{t}smu->min_power_limit = {min_w};\n"
+    f"{t}dev_info(adev->dev,\n"
+    f"{t}\t \"V620 PPT: host minimum overridden to {min_w} W (firmware max %u W)\\n\",\n"
+    f"{t}\t smu->max_power_limit);\n"
+    f"{i}}}\n"
+    f"{i}{END}\n"
+)
+new = text[:m.end()] + injection + text[m.end():]
+diff = "".join(difflib.unified_diff(
+    text.splitlines(keepends=True), new.splitlines(keepends=True),
+    fromfile=f"a/{rel}", tofile=f"b/{rel}"))
+if not diff:
+    raise SystemExit("ERROR: generated empty patch")
+out.write_text(diff)
+print(f"source: {target}")
+print(f"patch:  {out}")
+print(f"V620 minimum: {min_w} W")
+PY
+
+tmpconf="$(mktemp)"
+if [[ -f "$OVERRIDE" ]]; then
+  awk '
+    /^# V620_PPT_DKMS_BEGIN$/ {skip=1; next}
+    /^# V620_PPT_DKMS_END$/   {skip=0; next}
+    !skip {print}
+  ' "$OVERRIDE" > "$tmpconf"
+else
+  : > "$tmpconf"
+fi
+
+max_idx=-1
+while IFS= read -r idx; do
+  [[ "$idx" =~ ^[0-9]+$ ]] || continue
+  (( idx > max_idx )) && max_idx=$idx
+done < <(grep -hEo 'PATCH\[[0-9]+\]' "$SRC/dkms.conf" "$tmpconf" 2>/dev/null | grep -Eo '[0-9]+' || true)
+idx=$((max_idx + 1))
+
+{
+  cat "$tmpconf"
+  echo '# V620_PPT_DKMS_BEGIN'
+  printf 'PATCH[%d]="%s"\n' "$idx" "$PATCH_NAME"
+  echo '# V620_PPT_DKMS_END'
+} > "$OVERRIDE"
+rm -f "$tmpconf"
+
+log "REBUILD AMDGPU DKMS FOR $KVER"
+status="$(dkms status -m amdgpu -v "$VER" -k "$KVER" 2>/dev/null || true)"
+if [[ -n "$status" ]]; then
+  dkms remove -m amdgpu -v "$VER" -k "$KVER"
+fi
+
+dkms build -m amdgpu -v "$VER" -k "$KVER" --force
+
+grep -Rqs 'V620_PPT_OVERRIDE_BEGIN' "/var/lib/dkms/amdgpu/$VER/build" || \
+  die "DKMS build completed but the V620 patch marker was not found in its build tree"
+
+dkms install -m amdgpu -v "$VER" -k "$KVER" --force
+
+log "ESSENTIAL BUILD CHECK"
+status="$(dkms status -m amdgpu -v "$VER" -k "$KVER")"
+echo "$status"
+grep -q 'installed' <<<"$status" || die "DKMS did not finish in installed state"
+
+echo
+printf 'PASS: AMDGPU %s is DKMS-built for %s with the V620 %s W minimum-PPT patch.\n' "$VER" "$KVER" "$MIN_W"
+echo "The running kernel is unchanged until reboot."
+echo "Future AMD driver update: run   sudo v620-amdgpu-port"
+echo "After reboot:                   sudo v620-amdgpu-port --verify"
+
+if [[ -t 0 ]]; then
+  echo
+  read -r -p 'Reboot now? [y/N] ' ans
+  if [[ "$ans" =~ ^[Yy]$ ]]; then
+    reboot
+  fi
+fi
