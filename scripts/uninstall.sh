@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: LicenseRef-V620-Powercap-1.0
 BIN_DIR="${BIN_DIR:-/usr/local/sbin}"
 SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 CONFIG_FILE="${CONFIG_FILE:-/etc/v620-powercap.conf}"

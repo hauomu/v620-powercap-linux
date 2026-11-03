@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: LicenseRef-V620-Powercap-1.0
 AMD_VENDOR="0x1002"
 V620_DEVICE="0x73a1"
 V620_SUBSYSTEM_VENDOR="0x1002"

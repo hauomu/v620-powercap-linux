@@ -1,8 +1,50 @@
-SPDX-License-Identifier: GPL-2.0-only
+V620 Powercap License 1.0
 
-This project is licensed under the GNU General Public License, version 2 only (GPL-2.0-only).
+Copyright (c) 2026 hauomu
 
-The canonical license text is published by the Free Software Foundation at:
-https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+This repository is under two licenses.
 
-Kernel-derived changes in this repository are distributed under the Linux kernel's GPL-2.0-only licensing terms.
+1. These files stay under GPL-2.0-only (see LICENSES/GPL-2.0-only.txt), because
+   they generate and apply changes to the GPL-licensed Linux amdgpu driver:
+
+   - scripts/patch-v620-ppt.py
+   - scripts/v620-amdgpu-port
+
+   The restriction below does not apply to them. Kernel modules and drivers
+   built with them are also subject to GPL-2.0-only.
+
+2. Everything else is under the terms below. Versions published earlier under
+   GPL-2.0-only remain available under that license. This part is a
+   source-available license, not an open-source license.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+these files, to use, copy, modify, merge, publish, distribute, sublicense, and
+sell copies of them, subject to the following conditions:
+
+This copyright notice, this permission notice, and the restriction below shall
+be included in all copies or substantial portions of these files.
+
+AI and Data Mining Restriction
+
+Unless you first obtain explicit written permission from hauomu, you may not:
+
+- scrape, harvest, or bulk-collect these files; or
+- use these files, or any part of it, for text and data mining, to train,
+  fine-tune, validate, or evaluate any machine learning or artificial
+  intelligence model, or as part of a dataset for those purposes.
+
+hauomu expressly reserves all rights against text and data mining, including
+under Article 4(3) of Directive (EU) 2019/790.
+
+This restriction does not limit ordinary viewing, forking, or cloning through
+GitHub as its Terms of Service allow, or search-engine indexing. It also does
+not stop you running these files, or having an AI tool read or run it to do your own
+work, as long as its contents are not kept or used to train a model. It does
+not limit any right that applicable law does not allow a license to exclude.
+
+THESE FILES ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THESE FILES OR THE USE OR OTHER DEALINGS IN THEM.

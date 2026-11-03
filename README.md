@@ -207,3 +207,7 @@ The original machine-specific path names, PCI BDF and `hwmonN` index have intent
 ## License
 
 GPL-2.0-only. See [`LICENSE`](LICENSE).
+
+## License update: V620 Powercap License 1.0
+
+This version replaces the GPL-2.0-only line above. `scripts/patch-v620-ppt.py` and `scripts/v620-amdgpu-port` stay under GPL-2.0-only because they change the GPL-licensed Linux amdgpu driver. Everything else is now under the **V620 Powercap License 1.0**: permissive terms plus a restriction on scraping, text and data mining, and AI training. See `LICENSE` for the complete terms.
